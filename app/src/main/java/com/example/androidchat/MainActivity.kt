@@ -205,24 +205,31 @@ private const val TYPING_IDLE_MS = 1_200L
  */
 private val Decelerate = CubicBezierEasing(0f, 0f, 0.5f, 1f)
 
-// 320. This was 480 — lengthened on the theory that Android needs more room than
-// iOS's 420 because each row animates on its own rather than reflowing as one
-// VStack. That reasoning only held for SENT messages, where the list travels a
-// full bubble height. A RECEIVED message travels much less: the typing dots
-// already occupied the space, so the net movement is only bubble height minus
-// pill height, roughly a third as far. Same 480ms over a third of the distance
-// is a third of the speed, and slow short travel does not read as smooth — it
-// reads as floating, which is the "weird spring" with no spring in it. The
-// duration is shared, so it has to suit the shorter of the two journeys.
-// Now 420 — iOS's layoutSpring duration exactly. This number has moved twice
-// (480, then 320) chasing a feel problem that does not live in the duration.
-// The brief is parity with iOS, so it is simply iOS's number.
+// 460. The number moved three times before landing here, and each move rules
+// out a wrong explanation, so the history is worth keeping:
+//
+//   480 — on the theory that Android needs more room than iOS's 420 because
+//         each row animates on its own rather than reflowing as one VStack.
+//         That holds only for SENT messages, where the list travels a full
+//         bubble height.
+//   320 — because a RECEIVED message travels much less: the typing dots already
+//         occupied the space, so the net movement is bubble height minus pill
+//         height, roughly a third as far. The same 480ms over a third of the
+//         distance is a third of the speed, and slow short travel does not read
+//         as smooth, it reads as floating. That float is what gets described as
+//         a spring, and there is no spring in this file.
+//   420 — iOS's layoutSpring duration exactly, once the brief became parity.
+//   460 — 420 taken 10% slower, judged by eye on device, because iOS's own
+//         number still read as hurried here.
+//
+// The duration is shared between the bubble's grow and the neighbours' slide,
+// so it has to suit the shorter of the two journeys.
 //
 // It also lands the fade for free: alpha in appearModifier is derived from this
 // animation's own progress and completes at p = 0.40, which on
-// cubic-bezier(0, 0, 0.5, 1) is t = 0.238 -> 0.238 x 420ms = 100ms, against
-// iOS's hardcoded 110ms opacity transition. Change this duration and the fade
-// silently drifts away from iOS.
+// cubic-bezier(0, 0, 0.5, 1) is t = 0.238 -> 0.238 x 460ms = 110ms, matching
+// iOS's hardcoded 110ms opacity transition almost exactly. Change this duration
+// and the fade silently drifts away from iOS.
 private val LayoutSpring: FiniteAnimationSpec<Float> =
     if (FLAG_EASE) tween(460, easing = Decelerate)
     else spring(
