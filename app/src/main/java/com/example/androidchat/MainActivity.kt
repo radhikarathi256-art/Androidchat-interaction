@@ -699,10 +699,14 @@ private val TickBlue = Color(0xFF0BA5EC)
 // unit is one dp: the exported bubble is 268 units wide, which is 70% of a
 // 390pt screen — the same cap the bubble uses.
 private const val TickW = 10.4f    // one checkmark
+private const val TickH = 8f       // and its height
 private const val TickGap = 3.2f   // horizontal offset between the two
+private const val ClockD = 12f     // pending clock, drawn at 12x12
+// The slot is sized to the largest glyph in it, so switching state never
+// reflows. 12dp still sits inside the 10sp timestamp's line box next to it,
+// so the bubble does not grow either.
 private const val SlotW = TickW + TickGap
-private const val SlotH = 8f
-private const val ClockD = 6.667f
+private const val SlotH = ClockD
 
 /**
  * Four delivery states in a slot of fixed size, so a status change can never
@@ -753,14 +757,16 @@ private fun StatusTicks(status: DeliveryStatus) {
     Canvas(Modifier.width(SlotW.dp).height(SlotH.dp)) {
         fun u(v: Float) = v.dp.toPx()
 
-        // The design's checkmark, origin at its own top-left.
+        // The design's checkmark, origin at its own top-left. The ticks keep
+        // their 8dp height and are centred in the slot the clock sizes.
+        val dy = (SlotH - TickH) / 2f
         fun tick(dx: Float) = Path().apply {
-            moveTo(u(dx + 10.400f), u(0.844f))
-            lineTo(u(dx + 3.302f), u(8.000f))
-            lineTo(u(dx + 0.000f), u(4.669f))
-            lineTo(u(dx + 0.837f), u(3.825f))
-            lineTo(u(dx + 3.302f), u(6.312f))
-            lineTo(u(dx + 9.563f), u(0.000f))
+            moveTo(u(dx + 10.400f), u(dy + 0.844f))
+            lineTo(u(dx + 3.302f), u(dy + 8.000f))
+            lineTo(u(dx + 0.000f), u(dy + 4.669f))
+            lineTo(u(dx + 0.837f), u(dy + 3.825f))
+            lineTo(u(dx + 3.302f), u(dy + 6.312f))
+            lineTo(u(dx + 9.563f), u(dy + 0.000f))
             close()
         }
 
@@ -771,7 +777,10 @@ private fun StatusTicks(status: DeliveryStatus) {
         drawPath(tick(0f), tint, alpha = ticks.value * second.value)
 
         if (clock.value > 0f) {
-            val s = u(1f)
+            // Hands and stroke stay in the same proportion to the dial they
+            // were drawn at, so growing the dial does not restyle the glyph.
+            val k = ClockD / 6.667f
+            val s = u(1f * k)
             val cx = u(SlotW - 0.667f - ClockD / 2f)
             val cy = u(SlotH / 2f)
             val c = Offset(cx, cy)
@@ -780,11 +789,11 @@ private fun StatusTicks(status: DeliveryStatus) {
                 alpha = clock.value, style = Stroke(s),
             )
             drawLine(
-                Muted, Offset(cx, cy - u(1.333f)), c,
+                Muted, Offset(cx, cy - u(1.333f * k)), c,
                 strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
             )
             drawLine(
-                Muted, c, Offset(cx + u(0.833f), cy + u(0.833f)),
+                Muted, c, Offset(cx + u(0.833f * k), cy + u(0.833f * k)),
                 strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
             )
         }
