@@ -5,19 +5,18 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VisibilityThreshold
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateIntAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.VisibilityThreshold
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -25,6 +24,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,10 +38,10 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imeAnimationTarget
 import androidx.compose.foundation.layout.navigationBars
@@ -51,8 +51,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -60,12 +60,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -82,8 +82,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -96,10 +99,10 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -107,14 +110,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 // MARK: - Palette (shared with the SwiftUI seeker app)
 
@@ -686,31 +689,81 @@ private fun SwipeToReply(onReply: () -> Unit, content: @Composable () -> Unit) {
     }
 }
 
+private val TickBlue = Color(0xFF1E88E5)
+
 /**
- * Two ticks in a slot of fixed size, so a status change can never alter the
- * bubble's width or height (§13/§14). Only opacity and colour animate; nothing
- * here touches geometry, and the row keeps its identity so the LazyColumn
- * reuses the same node.
+ * Four delivery states in a slot of fixed size, so a status change can never
+ * alter the bubble's width or height (§13/§14):
+ *
+ *   sending   — outline clock
+ *   sent      — one grey tick
+ *   delivered — two grey ticks
+ *   read      — two blue ticks
+ *
+ * Nothing here touches geometry, and the row keeps its identity so the
+ * LazyColumn reuses the same node.
+ *
+ * RECOMPOSITION: the animated values are held as State objects and read *inside*
+ * graphicsLayer lambdas, which run in the draw phase. Reading them out here with
+ * `by` instead would recompose this composable — and therefore re-measure the
+ * bubble's Row — on every frame of the 180ms transition, roughly 11 times per
+ * status change, four times per message. The lambda form redraws without
+ * recomposing or re-laying out at all.
+ *
+ * Colour is also animated as alpha rather than with animateColorAsState, for the
+ * same reason: Icon's tint is a plain parameter, so a colour animation can only
+ * be applied by recomposing. Grey and blue ticks are stacked instead and the
+ * blue pair fades in on top, which is a draw-phase change.
+ *
+ * The clock is drawn rather than taken from Icons: Schedule is not in Compose's
+ * core icon set, and depending on material-icons-extended for one glyph costs
+ * megabytes.
  */
 @Composable
 private fun StatusTicks(status: DeliveryStatus) {
-    val secondTick by animateFloatAsState(
-        if (status >= DeliveryStatus.delivered) 1f else 0f,
-        tween(180), label = "tick2",
+    val clock = animateFloatAsState(
+        if (status == DeliveryStatus.sending) 1f else 0f, tween(180), label = "clock",
     )
-    val faded by animateFloatAsState(
-        if (status == DeliveryStatus.sending) 0.35f else 1f,
-        tween(180), label = "tick1",
+    val ticks = animateFloatAsState(
+        if (status == DeliveryStatus.sending) 0f else 1f, tween(180), label = "ticks",
     )
-    val tint by animateColorAsState(
-        if (status == DeliveryStatus.read) Color(0xFF1E88E5) else Muted,
-        tween(180), label = "tickColor",
+    val second = animateFloatAsState(
+        if (status >= DeliveryStatus.delivered) 1f else 0f, tween(180), label = "second",
     )
+    val blue = animateFloatAsState(
+        if (status == DeliveryStatus.read) 1f else 0f, tween(180), label = "blue",
+    )
+
     Box(Modifier.width(15.dp).height(11.dp)) {
-        Icon(Icons.Filled.Check, null, Modifier.size(11.dp).alpha(faded), tint)
+        Canvas(Modifier.size(11.dp).graphicsLayer { alpha = clock.value }) {
+            val stroke = 1.2.dp.toPx()
+            val c = Offset(size.width / 2f, size.height / 2f)
+            val r = size.minDimension / 2f - stroke
+            drawCircle(Muted, r, c, style = Stroke(stroke))
+            // Hands at roughly 10:10, the conventional clock-face pose.
+            drawLine(Muted, c, Offset(c.x, c.y - r * 0.55f), stroke, StrokeCap.Round)
+            drawLine(Muted, c, Offset(c.x + r * 0.45f, c.y), stroke, StrokeCap.Round)
+        }
         Icon(
             Icons.Filled.Check, null,
-            Modifier.offset(x = 4.dp).size(11.dp).alpha(secondTick), tint,
+            Modifier.size(11.dp).graphicsLayer { alpha = ticks.value }, Muted,
+        )
+        Icon(
+            Icons.Filled.Check, null,
+            Modifier.offset(x = 4.dp).size(11.dp)
+                .graphicsLayer { alpha = ticks.value * second.value },
+            Muted,
+        )
+        Icon(
+            Icons.Filled.Check, null,
+            Modifier.size(11.dp).graphicsLayer { alpha = ticks.value * blue.value },
+            TickBlue,
+        )
+        Icon(
+            Icons.Filled.Check, null,
+            Modifier.offset(x = 4.dp).size(11.dp)
+                .graphicsLayer { alpha = ticks.value * second.value * blue.value },
+            TickBlue,
         )
     }
 }
