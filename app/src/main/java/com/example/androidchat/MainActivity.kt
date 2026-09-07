@@ -84,10 +84,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -689,7 +691,20 @@ private fun SwipeToReply(onReply: () -> Unit, content: @Composable () -> Unit) {
     }
 }
 
-private val TickBlue = Color(0xFF1E88E5)
+// Sampled from the design export, "Group 1261158377.svg". These are the icon's
+// own colours and are intentionally separate from the Muted/Subtle palette,
+// which differs from the design by 1-2 points per channel elsewhere.
+private val TickGrey = Color(0xFF98A2B3)
+private val TickBlue = Color(0xFF0BA5EC)
+
+// Glyph metrics in dp, lifted straight from the SVG path data. One SVG user
+// unit is one dp: the exported bubble is 268 units wide, which is 70% of a
+// 390pt screen — the same cap the bubble uses.
+private const val TickW = 10.4f    // one checkmark
+private const val TickGap = 3.2f   // horizontal offset between the two
+private const val SlotW = TickW + TickGap
+private const val SlotH = 8f
+private const val ClockD = 6.667f
 
 /**
  * Four delivery states in a slot of fixed size, so a status change can never
@@ -700,24 +715,27 @@ private val TickBlue = Color(0xFF1E88E5)
  *   delivered — two grey ticks
  *   read      — two blue ticks
  *
- * Nothing here touches geometry, and the row keeps its identity so the
- * LazyColumn reuses the same node.
+ * The glyphs are drawn from the design's own path data rather than assembled
+ * out of Icons.Filled.Check. Two reasons: Material's check is a different
+ * shape, and the design's tick has a bevelled tail that reads as deliberate at
+ * this size. The clock is not in Compose's core icon set at all, and pulling
+ * material-icons-extended for one glyph costs megabytes.
  *
- * RECOMPOSITION: the animated values are held as State objects and read *inside*
- * graphicsLayer lambdas, which run in the draw phase. Reading them out here with
- * `by` instead would recompose this composable — and therefore re-measure the
- * bubble's Row — on every frame of the 180ms transition, roughly 11 times per
- * status change, four times per message. The lambda form redraws without
- * recomposing or re-laying out at all.
+ * ALIGNMENT: the pair is right-aligned, matching the SVG, where the single tick
+ * and the right-hand tick of the pair share an edge at x=316. So going from
+ * sent to delivered, the tick already on screen does not move and the new one
+ * appears to its left. Growing rightward instead shifts the existing tick and
+ * reads as a nudge.
  *
- * Colour is also animated as alpha rather than with animateColorAsState, for the
- * same reason: Icon's tint is a plain parameter, so a colour animation can only
- * be applied by recomposing. Grey and blue ticks are stacked instead and the
- * blue pair fades in on top, which is a draw-phase change.
+ * RECOMPOSITION: the animated values are held as State objects and read inside
+ * the Canvas draw lambda, which runs in the draw phase. Reading them out here
+ * with `by` would recompose this composable — and re-measure the bubble's Row —
+ * on every frame of each 180ms transition, roughly 11 frames per change and
+ * four changes per message. This way nothing above the draw phase re-runs.
  *
- * The clock is drawn rather than taken from Icons: Schedule is not in Compose's
- * core icon set, and depending on material-icons-extended for one glyph costs
- * megabytes.
+ * Colour is interpolated in the same lambda rather than with
+ * animateColorAsState, for the same reason, and it also avoids stacking a blue
+ * copy over a grey one and blending muddily through the crossfade.
  */
 @Composable
 private fun StatusTicks(status: DeliveryStatus) {
@@ -734,37 +752,44 @@ private fun StatusTicks(status: DeliveryStatus) {
         if (status == DeliveryStatus.read) 1f else 0f, tween(180), label = "blue",
     )
 
-    Box(Modifier.width(15.dp).height(11.dp)) {
-        Canvas(Modifier.size(11.dp).graphicsLayer { alpha = clock.value }) {
-            val stroke = 1.2.dp.toPx()
-            val c = Offset(size.width / 2f, size.height / 2f)
-            val r = size.minDimension / 2f - stroke
-            drawCircle(Muted, r, c, style = Stroke(stroke))
-            // Hands at roughly 10:10, the conventional clock-face pose.
-            drawLine(Muted, c, Offset(c.x, c.y - r * 0.55f), stroke, StrokeCap.Round)
-            drawLine(Muted, c, Offset(c.x + r * 0.45f, c.y), stroke, StrokeCap.Round)
+    Canvas(Modifier.width(SlotW.dp).height(SlotH.dp)) {
+        fun u(v: Float) = v.dp.toPx()
+
+        // The design's checkmark, origin at its own top-left.
+        fun tick(dx: Float) = Path().apply {
+            moveTo(u(dx + 10.400f), u(0.844f))
+            lineTo(u(dx + 3.302f), u(8.000f))
+            lineTo(u(dx + 0.000f), u(4.669f))
+            lineTo(u(dx + 0.837f), u(3.825f))
+            lineTo(u(dx + 3.302f), u(6.312f))
+            lineTo(u(dx + 9.563f), u(0.000f))
+            close()
         }
-        Icon(
-            Icons.Filled.Check, null,
-            Modifier.size(11.dp).graphicsLayer { alpha = ticks.value }, Muted,
-        )
-        Icon(
-            Icons.Filled.Check, null,
-            Modifier.offset(x = 4.dp).size(11.dp)
-                .graphicsLayer { alpha = ticks.value * second.value },
-            Muted,
-        )
-        Icon(
-            Icons.Filled.Check, null,
-            Modifier.size(11.dp).graphicsLayer { alpha = ticks.value * blue.value },
-            TickBlue,
-        )
-        Icon(
-            Icons.Filled.Check, null,
-            Modifier.offset(x = 4.dp).size(11.dp)
-                .graphicsLayer { alpha = ticks.value * second.value * blue.value },
-            TickBlue,
-        )
+
+        val tint = lerp(TickGrey, TickBlue, blue.value)
+        // Front tick sits on the right and never moves; the second joins on its
+        // left. Drawn in one layer, so the overlap cannot double-darken.
+        drawPath(tick(TickGap), tint, alpha = ticks.value)
+        drawPath(tick(0f), tint, alpha = ticks.value * second.value)
+
+        if (clock.value > 0f) {
+            val s = u(1f)
+            val cx = u(SlotW - 0.667f - ClockD / 2f)
+            val cy = u(SlotH / 2f)
+            val c = Offset(cx, cy)
+            drawCircle(
+                TickGrey, u(ClockD / 2f) - s / 2f, c,
+                alpha = clock.value, style = Stroke(s),
+            )
+            drawLine(
+                TickGrey, Offset(cx, cy - u(1.333f)), c,
+                strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
+            )
+            drawLine(
+                TickGrey, c, Offset(cx + u(0.833f), cy + u(0.833f)),
+                strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
+            )
+        }
     }
 }
 
