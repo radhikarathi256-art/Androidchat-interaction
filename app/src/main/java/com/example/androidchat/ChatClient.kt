@@ -34,6 +34,9 @@ private const val ROOM = "demo"
 // so this file is safe to publish. See README for setup.
 private val SUPABASE_KEY = BuildConfig.SUPABASE_KEY
 
+/** How long a refused send stays on `sending` before it flips to `failed`. */
+private const val FAIL_DWELL_MS = 500L
+
 enum class Role { seeker, astrologer }
 
 // This app is the astrologer. Flip these two lines to turn it into a seeker.
@@ -47,9 +50,16 @@ enum class Kind { text, voice, image }
  * Declared in order, so the compiler-generated `compareTo` gives us "may only
  * move forward" for free. Acks race — a `read` can overtake its own
  * `delivered` — and a tick sliding backwards is a visible regression.
- * [ChatClient.advance] is the only writer and it enforces this.
+ * [ChatClient.advance] is the only writer of the forward path and it enforces
+ * this.
+ *
+ * `failed` is deliberately declared FIRST, below `sending`, for two reasons:
+ * every `status >= x` test in the UI then reads false for a failed bubble
+ * without needing a special case, and `advance` can never reach `failed`
+ * (nothing is below it), so failure has to go through [ChatClient.fail]. Retry
+ * is then just an ordinary forward move, failed -> sending.
  */
-enum class DeliveryStatus { sending, sent, delivered, read }
+enum class DeliveryStatus { failed, sending, sent, delivered, read }
 
 data class Message(
     val id: String,
@@ -183,36 +193,75 @@ class ChatClient : ViewModel() {
     // MARK: Send
 
     fun send(text: String, replyToId: String? = null) {
-        val id = UUID.randomUUID().toString()
-        msgs.add(
-            Message(
-                id = id,
-                from = Sender.valueOf(MY_ROLE.name),
-                text = text,
-                status = DeliveryStatus.sending,
-                replyToId = replyToId,
-            )
+        val m = Message(
+            id = UUID.randomUUID().toString(),
+            from = Sender.valueOf(MY_ROLE.name),
+            text = text,
+            status = DeliveryStatus.sending,
+            replyToId = replyToId,
         )
-        val queued = sendRaw(topic, "broadcast", JSONObject().apply {
-            put("type", "broadcast")
-            put("event", "msg")
-            put("payload", JSONObject().apply {
-                put("id", id)
-                put("kind", "text")
-                put("from", MY_ROLE.name)
-                put("ts", System.currentTimeMillis())
-                put("text", text)
-                if (replyToId != null) put("replyToId", replyToId)
-            })
-        })
-        // Handed to an open socket = Sent. If the socket is down the tick
-        // correctly stays faint on Sending.
-        if (queued) advance(id, DeliveryStatus.sent)
+        msgs.add(m)
+        deliver(m)
         setTyping(false)
     }
 
     /**
-     * The only writer of [Message.status], and it only ever moves forward.
+     * Re-send a bubble the socket refused. Goes back to `sending` first, so the
+     * tap has a visible result on the very next frame even when the socket is
+     * still down and the retry is about to fail again.
+     */
+    fun retry(id: String) {
+        val i = msgs.indexOfFirst { it.id == id }
+        if (i < 0 || msgs[i].status != DeliveryStatus.failed) return
+        msgs[i] = msgs[i].copy(status = DeliveryStatus.sending)
+        deliver(msgs[i])
+    }
+
+    /**
+     * Puts a `sending` bubble on the wire. Handed to an open socket = `sent`;
+     * refused = `failed`, which is what draws the error glyph and the retry
+     * line.
+     */
+    private fun deliver(m: Message) {
+        val queued = sendRaw(topic, "broadcast", JSONObject().apply {
+            put("type", "broadcast")
+            put("event", "msg")
+            put("payload", JSONObject().apply {
+                put("id", m.id)
+                put("kind", "text")
+                put("from", MY_ROLE.name)
+                put("ts", m.ts)
+                put("text", m.text)
+                if (m.replyToId != null) put("replyToId", m.replyToId)
+            })
+        })
+        if (queued) {
+            advance(m.id, DeliveryStatus.sent)
+        } else {
+            // sendRaw fails synchronously when the socket is closed, so failing
+            // here immediately would flash the clock for a single frame and the
+            // state change would be unreadable. Hold `sending` long enough to
+            // register as an attempt.
+            viewModelScope.launch {
+                delay(FAIL_DWELL_MS)
+                fail(m.id)
+            }
+        }
+    }
+
+    /**
+     * The only writer of `failed`, and only from `sending` — a message that
+     * landed while we were waiting out the dwell must keep its ticks.
+     */
+    private fun fail(id: String) {
+        val i = msgs.indexOfFirst { it.id == id }
+        if (i < 0 || msgs[i].status != DeliveryStatus.sending) return
+        msgs[i] = msgs[i].copy(status = DeliveryStatus.failed)
+    }
+
+    /**
+     * The forward path for [Message.status]; it only ever moves forward. The
+     * one other writer is [fail], which moves backwards on purpose.
      *
      * Replaces the element in place so the row keeps its identity and the
      * LazyColumn reuses the same node (§15) — the bubble must not be rebuilt

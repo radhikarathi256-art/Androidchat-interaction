@@ -23,12 +23,15 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -83,11 +86,14 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
@@ -100,6 +106,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -702,20 +709,42 @@ private const val TickW = 10.4f    // one checkmark
 private const val TickH = 8f       // and its height
 private const val TickGap = 3.2f   // horizontal offset between the two
 private const val ClockD = 12f     // pending clock, drawn at 12x12
+private const val ErrD = 10f       // error ring, 10x10 in "Error.svg"
 // The slot is sized to the largest glyph in it, so switching state never
 // reflows. 12dp still sits inside the 10sp timestamp's line box next to it,
 // so the bubble does not grow either.
 private const val SlotW = TickW + TickGap
 private const val SlotH = ClockD
 
+// Error red, sampled from "Error.svg". Note this is NOT EndRed (#D92E21) —
+// the two are a point apart per channel and the export is the source.
+private val ErrorRed = Color(0xFFD92D20)
+
+// Every glyph swap runs over this. Short enough not to lag the ack, long
+// enough that the scale reads as a change rather than a jump.
+private const val TickMs = 180
+
 /**
- * Four delivery states in a slot of fixed size, so a status change can never
+ * Five delivery states in a slot of fixed size, so a status change can never
  * alter the bubble's width or height (§13/§14):
  *
  *   sending   — outline clock
  *   sent      — one grey tick
  *   delivered — two grey ticks
  *   read      — two blue ticks
+ *   failed    — red error ring, plus the retry line under the bubble
+ *
+ * MOTION: no state swap is a bare crossfade. Every glyph also scales between
+ * 0.6 and 1 about its OWN centre over the same [TickMs], so the outgoing glyph
+ * collapses as the incoming one grows and the eye is given something to
+ * follow. The second tick additionally slides out leftward from behind the
+ * first, which is the direction it actually arrives from.
+ *
+ * All of that lives inside the draw lambda, which is what makes it free: a
+ * scale or translate applied here is paint-only, so none of it can reach
+ * measurement and none of it can move the bubble. Doing the same thing with
+ * `Modifier.scale` or an `AnimatedVisibility` would put it above the draw
+ * phase and reintroduce exactly the reflow this slot exists to prevent.
  *
  * The glyphs are drawn from the design's own path data rather than assembled
  * out of Icons.Filled.Check. Two reasons: Material's check is a different
@@ -741,21 +770,28 @@ private const val SlotH = ClockD
  */
 @Composable
 private fun StatusTicks(status: DeliveryStatus) {
+    val spec = tween<Float>(TickMs, easing = Decelerate)
     val clock = animateFloatAsState(
-        if (status == DeliveryStatus.sending) 1f else 0f, tween(180), label = "clock",
+        if (status == DeliveryStatus.sending) 1f else 0f, spec, label = "clock",
     )
     val ticks = animateFloatAsState(
-        if (status == DeliveryStatus.sending) 0f else 1f, tween(180), label = "ticks",
+        if (status >= DeliveryStatus.sent) 1f else 0f, spec, label = "ticks",
     )
     val second = animateFloatAsState(
-        if (status >= DeliveryStatus.delivered) 1f else 0f, tween(180), label = "second",
+        if (status >= DeliveryStatus.delivered) 1f else 0f, spec, label = "second",
     )
     val blue = animateFloatAsState(
-        if (status == DeliveryStatus.read) 1f else 0f, tween(180), label = "blue",
+        if (status == DeliveryStatus.read) 1f else 0f, spec, label = "blue",
+    )
+    val err = animateFloatAsState(
+        if (status == DeliveryStatus.failed) 1f else 0f, spec, label = "err",
     )
 
     Canvas(Modifier.width(SlotW.dp).height(SlotH.dp)) {
         fun u(v: Float) = v.dp.toPx()
+        // A glyph at progress p is 0.6 scale and invisible at 0, full size and
+        // opaque at 1. One helper so all five states swap on identical terms.
+        fun grow(p: Float) = 0.6f + 0.4f * p
 
         // The design's checkmark, origin at its own top-left. The ticks keep
         // their 8dp height and are centred in the slot the clock sizes.
@@ -770,32 +806,68 @@ private fun StatusTicks(status: DeliveryStatus) {
             close()
         }
 
+        val cy = u(SlotH / 2f)
         val tint = lerp(Muted, TickBlue, blue.value)
+
         // Front tick sits on the right and never moves; the second joins on its
-        // left. Drawn in one layer, so the overlap cannot double-darken.
-        drawPath(tick(TickGap), tint, alpha = ticks.value)
-        drawPath(tick(0f), tint, alpha = ticks.value * second.value)
+        // left, sliding out from behind it. Both are drawn inside one scale, so
+        // the pair grows as a unit and the overlap cannot double-darken.
+        if (ticks.value > 0f) {
+            val front = Offset(u(TickGap + TickW / 2f), cy)
+            scale(grow(ticks.value), pivot = front) {
+                drawPath(tick(TickGap), tint, alpha = ticks.value)
+                translate(left = u(TickGap * (1f - second.value))) {
+                    drawPath(tick(0f), tint, alpha = ticks.value * second.value)
+                }
+            }
+        }
 
         if (clock.value > 0f) {
             // Hands and stroke stay in the same proportion to the dial they
             // were drawn at, so growing the dial does not restyle the glyph.
             val k = ClockD / 6.667f
             val s = u(1f * k)
-            val cx = u(SlotW - 0.667f - ClockD / 2f)
-            val cy = u(SlotH / 2f)
-            val c = Offset(cx, cy)
-            drawCircle(
-                Muted, u(ClockD / 2f) - s / 2f, c,
-                alpha = clock.value, style = Stroke(s),
-            )
-            drawLine(
-                Muted, Offset(cx, cy - u(1.333f * k)), c,
-                strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
-            )
-            drawLine(
-                Muted, c, Offset(cx + u(0.833f * k), cy + u(0.833f * k)),
-                strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
-            )
+            val c = Offset(u(SlotW - 0.667f - ClockD / 2f), cy)
+            scale(grow(clock.value), pivot = c) {
+                drawCircle(
+                    Muted, u(ClockD / 2f) - s / 2f, c,
+                    alpha = clock.value, style = Stroke(s),
+                )
+                drawLine(
+                    Muted, Offset(c.x, c.y - u(1.333f * k)), c,
+                    strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
+                )
+                drawLine(
+                    Muted, c, Offset(c.x + u(0.833f * k), c.y + u(0.833f * k)),
+                    strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
+                )
+            }
+        }
+
+        if (err.value > 0f) {
+            // "Error.svg": ring centred in a 10x10 box at 1dp stroke, an
+            // exclamation stem from 2 above centre to 0.5 below, and its dot
+            // 2 above the ring's foot. Right-aligned on the same 0.667 inset
+            // as the clock, so the glyph never shifts sideways between states.
+            val s = u(1f)
+            val c = Offset(u(SlotW - 0.667f - ErrD / 2f), cy)
+            scale(grow(err.value), pivot = c) {
+                drawCircle(
+                    ErrorRed, u(ErrD / 2f) - s / 2f, c,
+                    alpha = err.value, style = Stroke(s),
+                )
+                drawLine(
+                    ErrorRed, Offset(c.x, c.y - u(2f)), Offset(c.x, c.y + u(0.5f)),
+                    strokeWidth = s, cap = StrokeCap.Square, alpha = err.value,
+                )
+                // The export writes the dot as a 0.5dp square, which is
+                // sub-pixel and would grey out. Drawn at the stem's own 1dp
+                // weight instead, on the export's centre.
+                drawRect(
+                    ErrorRed, Offset(c.x - s / 2f, c.y + u(2f) - s / 2f),
+                    Size(s, s), alpha = err.value,
+                )
+            }
         }
     }
 }
@@ -821,63 +893,117 @@ private fun BubbleView(msg: Message, chat: ChatClient, bubbleModifier: Modifier 
     Row(Modifier.fillMaxWidth()) {
         if (isMine) Spacer(Modifier.weight(1f).widthIn(min = 50.dp))
 
-        Column(
-            horizontalAlignment = Alignment.End,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-            modifier = bubbleModifier
-                .widthIn(max = maxBubble)
-                .shadow(1.dp, bubbleShape(isMine))
-                .background(if (isMine) SentBg else Color.White, bubbleShape(isMine))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-        ) {
-            if (quoted != null) {
-                Row(
-                    Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(InkDark.copy(alpha = 0.06f))
-                        .padding(horizontal = 8.dp, vertical = 5.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Box(Modifier.width(2.dp).height(28.dp).background(SendOrange))
-                    Column {
-                        androidx.compose.material3.Text(
-                            if (quoted.from == chat.mySender) "You" else "Seeker",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = SendOrange,
-                        )
-                        androidx.compose.material3.Text(
-                            quoted.text ?: "[${quoted.kind.name}]",
-                            fontSize = 12.sp,
-                            color = Subtle,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+        // The bubble and its retry line stack, right-aligned together, so the
+        // line hangs off the bubble's tail edge as the export draws it.
+        Column(horizontalAlignment = Alignment.End) {
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                modifier = bubbleModifier
+                    .widthIn(max = maxBubble)
+                    .shadow(1.dp, bubbleShape(isMine))
+                    .background(if (isMine) SentBg else Color.White, bubbleShape(isMine))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                if (quoted != null) {
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(InkDark.copy(alpha = 0.06f))
+                            .padding(horizontal = 8.dp, vertical = 5.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Box(Modifier.width(2.dp).height(28.dp).background(SendOrange))
+                        Column {
+                            androidx.compose.material3.Text(
+                                if (quoted.from == chat.mySender) "You" else "Seeker",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = SendOrange,
+                            )
+                            androidx.compose.material3.Text(
+                                quoted.text ?: "[${quoted.kind.name}]",
+                                fontSize = 12.sp,
+                                color = Subtle,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
+                }
+
+                msg.text?.let {
+                    androidx.compose.material3.Text(
+                        text = it,
+                        fontSize = 15.sp,
+                        color = InkDark,
+                        textAlign = TextAlign.Start,
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    androidx.compose.material3.Text(
+                        timeFmt.format(Date(msg.ts)), fontSize = 10.sp, color = Subtle,
+                    )
+                    if (isMine) StatusTicks(msg.status)
                 }
             }
 
-            msg.text?.let {
-                androidx.compose.material3.Text(
-                    text = it,
-                    fontSize = 15.sp,
-                    color = InkDark,
-                    textAlign = TextAlign.Start,
-                )
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                androidx.compose.material3.Text(
-                    timeFmt.format(Date(msg.ts)), fontSize = 10.sp, color = Subtle,
-                )
-                if (isMine) StatusTicks(msg.status)
-            }
+            RetryLine(
+                visible = isMine && msg.status == DeliveryStatus.failed,
+                onRetry = { chat.retry(msg.id) },
+            )
         }
 
         if (!isMine) Spacer(Modifier.weight(1f).widthIn(min = 50.dp))
+    }
+}
+
+/**
+ * "Message not sent, tap to retry", from "Error.svg": #D92D20, italic, sitting
+ * under the bubble and right-aligned with it.
+ *
+ * This is the one part of the failed state that IS allowed to change geometry —
+ * the line genuinely occupies space, so it expands the row and the neighbours
+ * reflow underneath it. That is handled for free: the row is a LazyColumn item
+ * and its `placementSpec` already moves everything else on the same curve a new
+ * message uses.
+ *
+ * The tap has no ripple. A ripple would fill the text's own bounding box, which
+ * is a wide thin strip and reads as a stray highlight. A press scale and dim
+ * instead, both on a graphicsLayer so pressing cannot re-measure the strip.
+ */
+@Composable
+private fun RetryLine(visible: Boolean, onRetry: () -> Unit) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = expandVertically(tween(TickMs, easing = Decelerate), Alignment.Top) +
+                fadeIn(tween(TickMs, easing = Decelerate)),
+        exit = shrinkVertically(tween(TickMs, easing = Decelerate), Alignment.Top) +
+                fadeOut(tween(TickMs, easing = Decelerate)),
+    ) {
+        val press = remember { MutableInteractionSource() }
+        val down by press.collectIsPressedAsState()
+        val p = animateFloatAsState(if (down) 1f else 0f, tween(90), label = "press")
+        androidx.compose.material3.Text(
+            text = "Message not sent, tap to retry",
+            fontSize = 12.sp,
+            fontStyle = FontStyle.Italic,
+            color = ErrorRed,
+            modifier = Modifier
+                .graphicsLayer {
+                    val s = 1f - 0.03f * p.value
+                    scaleX = s
+                    scaleY = s
+                    alpha = 1f - 0.4f * p.value
+                    transformOrigin = TransformOrigin(1f, 0.5f)
+                }
+                .clickable(interactionSource = press, indication = null, onClick = onRetry)
+                .padding(top = 3.dp, bottom = 5.dp, start = 8.dp),
+        )
     }
 }
 
