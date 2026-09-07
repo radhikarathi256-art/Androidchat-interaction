@@ -125,7 +125,7 @@ import kotlinx.coroutines.launch
 
 private val InkDark = Color(0xFF1D2939)
 private val SentBg = Color(0xFFFCE1D7)
-private val ChatBg = Color(0xFFF0F5FF)
+private val ChatBg = Color(0xFFF8F4F1)
 private val Muted = Color(0xFF98A2B3)
 private val Subtle = Color(0xFF667085)
 private val PillBg = Color(0xFFF2F5F7)
