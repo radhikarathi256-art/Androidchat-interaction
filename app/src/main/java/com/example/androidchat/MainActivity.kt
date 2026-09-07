@@ -90,6 +90,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
@@ -708,13 +709,19 @@ private val TickBlue = Color(0xFF0BA5EC)
 private const val TickW = 10.4f    // one checkmark
 private const val TickH = 8f       // and its height
 private const val TickGap = 3.2f   // horizontal offset between the two
-private const val ClockD = 12f     // pending clock, drawn at 12x12
-private const val ErrD = 10f       // error ring, 10x10 in "Error.svg"
+// The pending and error glyphs are both exported inside a 12x12 icon box —
+// "Pending.svg" clips to exactly that — with the ring itself 10x10 and so
+// inset 1 all round. Both rings stop 1 short of the ticks' right edge (the
+// ticks reach 316 in the exports, the rings 315).
+private const val IconBox = 12f
+private const val RingD = 10f
+private const val RingInset = 1f
+private const val RingStroke = 1f
 // The slot is sized to the largest glyph in it, so switching state never
 // reflows. 12dp still sits inside the 10sp timestamp's line box next to it,
 // so the bubble does not grow either.
 private const val SlotW = TickW + TickGap
-private const val SlotH = ClockD
+private const val SlotH = IconBox
 
 // Error red, sampled from "Error.svg". Note this is NOT EndRed (#D92E21) —
 // the two are a point apart per channel and the export is the source.
@@ -822,49 +829,68 @@ private fun StatusTicks(status: DeliveryStatus) {
             }
         }
 
+        // Both rings share the same 10x10 footprint and the same right inset,
+        // so pending and failed occupy the identical spot and the glyph never
+        // shifts sideways between states.
+        val s = u(RingStroke)
+        val ringLeft = u(SlotW - RingInset - RingD)
+        val ringTop = u((SlotH - RingD) / 2f)
+        // Design units inside that box, so the path data below can be the
+        // export's own numbers unaltered.
+        fun rx(v: Float) = ringLeft + u(v * RingD / 10f)
+        fun ry(v: Float) = ringTop + u(v * RingD / 10f)
+        val ringC = Offset(rx(5f), ry(5f))
+
         if (clock.value > 0f) {
-            // Hands and stroke stay in the same proportion to the dial they
-            // were drawn at, so growing the dial does not restyle the glyph.
-            val k = ClockD / 6.667f
-            val s = u(1f * k)
-            val c = Offset(u(SlotW - 0.667f - ClockD / 2f), cy)
-            scale(grow(clock.value), pivot = c) {
-                drawCircle(
-                    Muted, u(ClockD / 2f) - s / 2f, c,
-                    alpha = clock.value, style = Stroke(s),
-                )
-                drawLine(
-                    Muted, Offset(c.x, c.y - u(1.333f * k)), c,
-                    strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
-                )
-                drawLine(
-                    Muted, c, Offset(c.x + u(0.833f * k), c.y + u(0.833f * k)),
-                    strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
+            // "Pending.svg". The ring is a SQUIRCLE, not a circle — Figma
+            // corner smoothing — which is why a drawCircle here read as the
+            // wrong glyph however it was sized. Transcribed as the export's
+            // four smoothed corners.
+            val ring = Path().apply {
+                moveTo(rx(0f), ry(5f))
+                cubicTo(rx(0f), ry(2.643f), rx(0f), ry(1.4645f), rx(0.732f), ry(0.7322f))
+                cubicTo(rx(1.464f), ry(0f), rx(2.643f), ry(0f), rx(5f), ry(0f))
+                cubicTo(rx(7.357f), ry(0f), rx(8.536f), ry(0f), rx(9.268f), ry(0.7322f))
+                cubicTo(rx(10f), ry(1.4645f), rx(10f), ry(2.643f), rx(10f), ry(5f))
+                cubicTo(rx(10f), ry(7.357f), rx(10f), ry(8.5355f), rx(9.268f), ry(9.2677f))
+                cubicTo(rx(8.536f), ry(10f), rx(7.357f), ry(10f), rx(5f), ry(10f))
+                cubicTo(rx(2.643f), ry(10f), rx(1.464f), ry(10f), rx(0.732f), ry(9.2677f))
+                cubicTo(rx(0f), ry(8.5355f), rx(0f), ry(7.357f), rx(0f), ry(5f))
+                close()
+            }
+            // One round-joined polyline, not two lines: the hands meet at the
+            // centre and the export's round join is what softens that corner.
+            val hands = Path().apply {
+                moveTo(rx(5f), ry(3f))
+                lineTo(rx(5f), ry(5f))
+                lineTo(rx(6.25f), ry(6.25f))
+            }
+            scale(grow(clock.value), pivot = ringC) {
+                drawPath(ring, Muted, alpha = clock.value, style = Stroke(s))
+                drawPath(
+                    hands, Muted, alpha = clock.value,
+                    style = Stroke(s, cap = StrokeCap.Round, join = StrokeJoin.Round),
                 )
             }
         }
 
         if (err.value > 0f) {
-            // "Error.svg": ring centred in a 10x10 box at 1dp stroke, an
-            // exclamation stem from 2 above centre to 0.5 below, and its dot
-            // 2 above the ring's foot. Right-aligned on the same 0.667 inset
-            // as the clock, so the glyph never shifts sideways between states.
-            val s = u(1f)
-            val c = Offset(u(SlotW - 0.667f - ErrD / 2f), cy)
-            scale(grow(err.value), pivot = c) {
+            // "Error.svg", where the ring IS a true circle. An exclamation
+            // stem from 2 above centre to 0.5 below, and its dot 2 below.
+            scale(grow(err.value), pivot = ringC) {
                 drawCircle(
-                    ErrorRed, u(ErrD / 2f) - s / 2f, c,
+                    ErrorRed, u(RingD / 2f) - s / 2f, ringC,
                     alpha = err.value, style = Stroke(s),
                 )
                 drawLine(
-                    ErrorRed, Offset(c.x, c.y - u(2f)), Offset(c.x, c.y + u(0.5f)),
+                    ErrorRed, Offset(ringC.x, ry(3f)), Offset(ringC.x, ry(5.5f)),
                     strokeWidth = s, cap = StrokeCap.Square, alpha = err.value,
                 )
                 // The export writes the dot as a 0.5dp square, which is
                 // sub-pixel and would grey out. Drawn at the stem's own 1dp
                 // weight instead, on the export's centre.
                 drawRect(
-                    ErrorRed, Offset(c.x - s / 2f, c.y + u(2f) - s / 2f),
+                    ErrorRed, Offset(ringC.x - s / 2f, ry(7f) - s / 2f),
                     Size(s, s), alpha = err.value,
                 )
             }
