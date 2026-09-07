@@ -114,6 +114,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -276,6 +277,30 @@ private val PlacementSpring: FiniteAnimationSpec<IntOffset> =
         dampingRatio = Spring.DampingRatioNoBouncy,
         stiffness = Spring.StiffnessMediumLow,
         visibilityThreshold = IntOffset.VisibilityThreshold,
+    )
+
+/**
+ * `layout`, for a row that changes its own height — currently only the retry
+ * line appearing and collapsing under a failed bubble.
+ *
+ * This has to be the same curve and the same duration as [PlacementSpring],
+ * because the two drive the two halves of ONE movement: this one grows or
+ * shrinks the row, and PlacementSpring slides every other row in the list by
+ * exactly that amount. Give them different specs and the messages above visibly
+ * lag behind the line that is pushing them, which is what "the rest of the
+ * messages should move in sync" means. Same rule as the typing indicator's
+ * shrinkVertically — keep the two numbers equal.
+ *
+ * Separate declaration only because the size transitions want a spec over
+ * IntSize and placement wants one over IntOffset; there is no shared supertype
+ * to hang a single value off.
+ */
+private val ReflowSpring: FiniteAnimationSpec<IntSize> =
+    if (FLAG_EASE) tween(460, easing = Decelerate)
+    else spring(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMediumLow,
+        visibilityThreshold = IntSize(1, 1),
     )
 
 /**
@@ -710,13 +735,20 @@ private const val TickW = 10.4f    // one checkmark
 private const val TickH = 8f       // and its height
 private const val TickGap = 3.2f   // horizontal offset between the two
 // The pending and error glyphs are both exported inside a 12x12 icon box —
-// "Pending.svg" clips to exactly that — with the ring itself 10x10 and so
-// inset 1 all round. Both rings stop 1 short of the ticks' right edge (the
-// ticks reach 316 in the exports, the rings 315).
+// "Pending.svg" clips to exactly that. Pending's ring is 10x10 inside that box,
+// inset 1 all round, and stops 1 short of the ticks' right edge (the ticks
+// reach 316 in the exports, the ring 315).
 private const val IconBox = 12f
 private const val RingD = 10f
 private const val RingInset = 1f
 private const val RingStroke = 1f
+// The error ring fills the icon box instead of sitting inset inside it: at
+// 10dp it read as smaller than the pending clock next to it, because the clock
+// carries hands that fill its middle while the error ring is mostly empty. 12dp
+// is the box, and the box is what both glyphs are specified at. It shares
+// pending's centre rather than its edge inset, so switching between the two
+// states grows the ring in place and never slides it sideways.
+private const val ErrRingD = IconBox
 // The slot is sized to the largest glyph in it, so switching state never
 // reflows. 12dp still sits inside the 10sp timestamp's line box next to it,
 // so the bubble does not grow either.
@@ -829,9 +861,10 @@ private fun StatusTicks(status: DeliveryStatus) {
             }
         }
 
-        // Both rings share the same 10x10 footprint and the same right inset,
-        // so pending and failed occupy the identical spot and the glyph never
-        // shifts sideways between states.
+        // Both rings share a centre — pending's, fixed by its 1dp right inset —
+        // so pending and failed sit in the identical spot and the glyph never
+        // shifts sideways between states even though failed is the larger of
+        // the two.
         val s = u(RingStroke)
         val ringLeft = u(SlotW - RingInset - RingD)
         val ringTop = u((SlotH - RingD) / 2f)
@@ -877,20 +910,24 @@ private fun StatusTicks(status: DeliveryStatus) {
         if (err.value > 0f) {
             // "Error.svg", where the ring IS a true circle. An exclamation
             // stem from 2 above centre to 0.5 below, and its dot 2 below.
+            // The export's numbers are all in its own 0..10 box, so they are
+            // read through the ring's centre and scaled up to [ErrRingD]
+            // rather than being retyped.
+            fun ey(v: Float) = ringC.y + u((v - 5f) * ErrRingD / 10f)
             scale(grow(err.value), pivot = ringC) {
                 drawCircle(
-                    ErrorRed, u(RingD / 2f) - s / 2f, ringC,
+                    ErrorRed, u(ErrRingD / 2f) - s / 2f, ringC,
                     alpha = err.value, style = Stroke(s),
                 )
                 drawLine(
-                    ErrorRed, Offset(ringC.x, ry(3f)), Offset(ringC.x, ry(5.5f)),
+                    ErrorRed, Offset(ringC.x, ey(3f)), Offset(ringC.x, ey(5.5f)),
                     strokeWidth = s, cap = StrokeCap.Square, alpha = err.value,
                 )
                 // The export writes the dot as a 0.5dp square, which is
                 // sub-pixel and would grey out. Drawn at the stem's own 1dp
                 // weight instead, on the export's centre.
                 drawRect(
-                    ErrorRed, Offset(ringC.x - s / 2f, ry(7f) - s / 2f),
+                    ErrorRed, Offset(ringC.x - s / 2f, ey(7f) - s / 2f),
                     Size(s, s), alpha = err.value,
                 )
             }
@@ -993,10 +1030,20 @@ private fun BubbleView(msg: Message, chat: ChatClient, bubbleModifier: Modifier 
  * under the bubble and right-aligned with it.
  *
  * This is the one part of the failed state that IS allowed to change geometry —
- * the line genuinely occupies space, so it expands the row and the neighbours
- * reflow underneath it. That is handled for free: the row is a LazyColumn item
- * and its `placementSpec` already moves everything else on the same curve a new
- * message uses.
+ * the line genuinely occupies space, so it expands the row and the messages
+ * above it slide by that height.
+ *
+ * Which is why the size transitions run on [ReflowSpring] and NOT on [TickMs].
+ * The row's height change and the neighbours' slide are one movement seen from
+ * two places: the height is animated here, the slide by the LazyColumn item's
+ * `placementSpec`. At 180ms here against placement's 460ms the line snapped
+ * shut while the messages above were still drifting down behind it, so on a
+ * retry tap the whole column looked like it was moving in two pieces. Both
+ * numbers now come from the same declaration.
+ *
+ * The fades stay short on purpose — the text has to be gone before the
+ * collapsing box starts clipping it, so it uses [EnterSpring], which finishes
+ * comfortably inside the height change.
  *
  * The tap has no ripple. A ripple would fill the text's own bounding box, which
  * is a wide thin strip and reads as a stray highlight. A press scale and dim
@@ -1006,10 +1053,8 @@ private fun BubbleView(msg: Message, chat: ChatClient, bubbleModifier: Modifier 
 private fun RetryLine(visible: Boolean, onRetry: () -> Unit) {
     AnimatedVisibility(
         visible = visible,
-        enter = expandVertically(tween(TickMs, easing = Decelerate), Alignment.Top) +
-                fadeIn(tween(TickMs, easing = Decelerate)),
-        exit = shrinkVertically(tween(TickMs, easing = Decelerate), Alignment.Top) +
-                fadeOut(tween(TickMs, easing = Decelerate)),
+        enter = expandVertically(ReflowSpring, Alignment.Top) + fadeIn(EnterSpring),
+        exit = shrinkVertically(ReflowSpring, Alignment.Top) + fadeOut(EnterSpring),
     ) {
         val press = remember { MutableInteractionSource() }
         val down by press.collectIsPressedAsState()
