@@ -123,11 +123,11 @@ import kotlinx.coroutines.launch
 
 // MARK: - Palette (shared with the SwiftUI seeker app)
 
-private val InkDark = Color(0xFF1C2938)
-private val SentBg = Color(0xFFFCE0D6)
+private val InkDark = Color(0xFF1D2939)
+private val SentBg = Color(0xFFFCE1D7)
 private val ChatBg = Color(0xFFF0F5FF)
-private val Muted = Color(0xFF99A3B3)
-private val Subtle = Color(0xFF667380)
+private val Muted = Color(0xFF98A2B3)
+private val Subtle = Color(0xFF667085)
 private val PillBg = Color(0xFFF2F5F7)
 private val LiveGreen = Color(0xFF039954)
 private val SendOrange = Color(0xFFF06938)
@@ -691,10 +691,8 @@ private fun SwipeToReply(onReply: () -> Unit, content: @Composable () -> Unit) {
     }
 }
 
-// Sampled from the design export, "Group 1261158377.svg". These are the icon's
-// own colours and are intentionally separate from the Muted/Subtle palette,
-// which differs from the design by 1-2 points per channel elsewhere.
-private val TickGrey = Color(0xFF98A2B3)
+// Read blue, sampled from the design export "Group 1261158377.svg". The tick
+// grey is just Muted, which now matches the export exactly.
 private val TickBlue = Color(0xFF0BA5EC)
 
 // Glyph metrics in dp, lifted straight from the SVG path data. One SVG user
@@ -766,7 +764,7 @@ private fun StatusTicks(status: DeliveryStatus) {
             close()
         }
 
-        val tint = lerp(TickGrey, TickBlue, blue.value)
+        val tint = lerp(Muted, TickBlue, blue.value)
         // Front tick sits on the right and never moves; the second joins on its
         // left. Drawn in one layer, so the overlap cannot double-darken.
         drawPath(tick(TickGap), tint, alpha = ticks.value)
@@ -778,15 +776,15 @@ private fun StatusTicks(status: DeliveryStatus) {
             val cy = u(SlotH / 2f)
             val c = Offset(cx, cy)
             drawCircle(
-                TickGrey, u(ClockD / 2f) - s / 2f, c,
+                Muted, u(ClockD / 2f) - s / 2f, c,
                 alpha = clock.value, style = Stroke(s),
             )
             drawLine(
-                TickGrey, Offset(cx, cy - u(1.333f)), c,
+                Muted, Offset(cx, cy - u(1.333f)), c,
                 strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
             )
             drawLine(
-                TickGrey, c, Offset(cx + u(0.833f), cy + u(0.833f)),
+                Muted, c, Offset(cx + u(0.833f), cy + u(0.833f)),
                 strokeWidth = s, cap = StrokeCap.Round, alpha = clock.value,
             )
         }
